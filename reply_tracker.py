@@ -3,7 +3,8 @@
 Getty reply tracker — daily Slack post.
 
 EnTrance replied conversations -> Close lookup by phone -> rep status changes.
-Posts to Slack:
+Writes data/slack/{main.md, thread.md, meta.json} for the Claude routine to post
+(or posts directly if SLACK_BOT_TOKEN is set):
   main message : (1) drop-out funnel by campaign  (2) progressing status distribution
   thread reply : "Who" list of progressing merchants
 
@@ -13,7 +14,8 @@ Modes:
   --dry-run                                # print Slack payloads, don't post
 
 Env / GitHub Secrets:
-  CLOSE_API_KEY, ENTRANCE_API_KEY, SLACK_BOT_TOKEN, SLACK_CHANNEL
+  CLOSE_API_KEY, SLACK_BOT_TOKEN, SLACK_CHANNEL
+  ENTRANCE_APP_KEY + ENTRANCE_AUTH_CODE (exchanged for a token at ENTRANCE_TOKEN_URL), or ENTRANCE_API_KEY
   ENTRANCE_CHANNELS_URL, ENTRANCE_CAMPAIGNS_URL   (verify vs docs.entrancegrp.com/#task-channels)
   LOOKBACK_DAYS (14), WORKSPACE_ID (2373), DATA_DIR (data)
 """
@@ -24,14 +26,18 @@ from pathlib import Path
 
 import requests
 
-WORKSPACE_ID = os.getenv("WORKSPACE_ID", "2373")
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "14"))
-ENTRANCE_KEY = os.getenv("ENTRANCE_API_KEY", "")
+WORKSPACE_ID = os.getenv("WORKSPACE_ID") or "2373"
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS") or "14")
+ENTRANCE_KEY = os.getenv("ENTRANCE_API_KEY", "")          # direct bearer token, if you have one
+ENTRANCE_APP_KEY = os.getenv("ENTRANCE_APP_KEY", "")
+ENTRANCE_AUTH_CODE = os.getenv("ENTRANCE_AUTH_CODE", "")
+# api.entrancegrp.com = token host. VERIFY path + body field names vs docs / the EnTrance MCP source.
+ENTRANCE_TOKEN_URL = os.getenv("ENTRANCE_TOKEN_URL") or "https://api.entrancegrp.com/token"
 CLOSE_KEY = os.getenv("CLOSE_API_KEY", "")
 SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
-ENTRANCE_CHANNELS_URL = os.getenv(
-    "ENTRANCE_CHANNELS_URL", f"https://entrancegrp.com/api/workspaces/{WORKSPACE_ID}/channels")
+ENTRANCE_CHANNELS_URL = (os.getenv("ENTRANCE_CHANNELS_URL")
+                         or f"https://entrancegrp.com/api/workspaces/{WORKSPACE_ID}/channels")
 ENTRANCE_CAMPAIGNS_URL = os.getenv("ENTRANCE_CAMPAIGNS_URL", "")
 PAGE_CAP = 20  # EnTrance hard cap; page with lastid
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -89,8 +95,30 @@ def get(url, **kw):
 
 
 # ------------------------------------------------------------------ EnTrance
+_TOKEN = None
+
+
+def entrance_headers():
+    """Bearer token: use ENTRANCE_API_KEY if set, else exchange app key + auth code."""
+    global _TOKEN
+    if ENTRANCE_KEY:
+        return {"Authorization": f"Bearer {ENTRANCE_KEY}"}
+    if _TOKEN is None:
+        if not (ENTRANCE_APP_KEY and ENTRANCE_AUTH_CODE):
+            sys.exit("EnTrance creds missing: set ENTRANCE_APP_KEY + ENTRANCE_AUTH_CODE (or ENTRANCE_API_KEY)")
+        r = requests.post(ENTRANCE_TOKEN_URL, timeout=30,
+                          json={"app_key": ENTRANCE_APP_KEY, "auth_code": ENTRANCE_AUTH_CODE})
+        r.raise_for_status()
+        j = r.json()
+        _TOKEN = (j.get("access_token") or j.get("token")
+                  or (j.get("record") or {}).get("token") or (j.get("data") or {}).get("token"))
+        if not _TOKEN:
+            sys.exit(f"EnTrance token exchange: no token in response keys {list(j)}")
+    return {"Authorization": f"Bearer {_TOKEN}"}
+
+
 def entrance_pages(url, extra=None):
-    headers = {"Authorization": f"Bearer {ENTRANCE_KEY}"}
+    headers = entrance_headers()
     lastid = None
     while True:
         params = {"limit": PAGE_CAP, "order": "DESC", **(extra or {})}
@@ -318,6 +346,17 @@ def main():
             w.writerows(rows)
 
     main_msg, thread_msg = render(rows, groups, gstats)
+
+    # Files the Claude routine picks up and posts to Slack (main + thread reply)
+    today = f"{datetime.now(timezone.utc):%Y-%m-%d}"
+    slack_dir = DATA_DIR / "slack"
+    slack_dir.mkdir(parents=True, exist_ok=True)
+    (slack_dir / "main.md").write_text(main_msg)
+    (slack_dir / "thread.md").write_text(thread_msg)
+    (slack_dir / "meta.json").write_text(json.dumps({
+        "date": today, "generated_at": datetime.now(timezone.utc).isoformat(),
+        "threads": len(rows), "progressing": sum(r["progressing"] for r in rows)}, indent=2))
+
     if a.dry_run or not SLACK_TOKEN:
         print(main_msg, "\n\n--- thread ---\n", thread_msg)
         return
