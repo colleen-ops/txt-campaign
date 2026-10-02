@@ -1,0 +1,36 @@
+name: reply-tracker
+
+on:
+  schedule:
+    - cron: "30 12 * * 1-5"   # 8:30am ET weekdays (EDT) — routine posts at 9:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Build funnel + progressing tables
+        env:
+          CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
+          ENTRANCE_APP_KEY: ${{ secrets.ENTRANCE_APP_KEY }}
+          ENTRANCE_AUTH_CODE: ${{ secrets.ENTRANCE_AUTH_CODE }}
+          ENTRANCE_TOKEN_URL: ${{ vars.ENTRANCE_TOKEN_URL }}
+          ENTRANCE_CHANNELS_URL: ${{ vars.ENTRANCE_CHANNELS_URL }}
+          ENTRANCE_CAMPAIGNS_URL: ${{ vars.ENTRANCE_CAMPAIGNS_URL }}
+          LOOKBACK_DAYS: "14"
+        run: python reply_tracker.py
+      - name: Commit tables for the Claude routine
+        run: |
+          git config user.name "reply-tracker-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "reply-tracker $(date -u +%F)"
+          git push
