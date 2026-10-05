@@ -163,8 +163,9 @@ def entrance_pages(url, extra=None, debug=False):
         params = {"limit": PAGE_CAP, "order": "DESC", **(extra or {})}
         if lastid:
             params["lastid"] = lastid
-        if cursor:
+        if cursor:                      # channels page by last_response timestamp
             params["last_response"] = cursor
+            params["ts"] = cursor
         r = requests.get(url, headers=headers, params=params, timeout=30)
         if debug and lastid is None:
             print(f"DEBUG GET {r.url} -> {r.status_code} body[:300]={r.text[:300]!r}")
@@ -196,10 +197,20 @@ def _first(r, *keys):
 def channels_from_api(since):
     out, raw, no_ts, no_phone, pages = [], 0, 0, 0, 0
     seen_ids = set()
-    # Recent blast replies mostly sit UNCLAIMED (Claims tab); Messages inbox = claimed. Pull both.
-    for claimed in ("false", "true"):
+    # Per Entrance docs:
+    #   unclaimed (Claims tab):  GET /channels?claimed=false            (no workspace prefix)
+    #   claimed  (Messages tab): GET /workspaces/:id/channels?claimed=true
+    sources = [
+        ("unclaimed", f"{ENTRANCE_BASE}/channels", {"claimed": "false"}),
+        ("unclaimed-ws", ENTRANCE_CHANNELS_URL, {"claimed": "false"}),
+        ("claimed", ENTRANCE_CHANNELS_URL, {"claimed": "true"}),
+    ]
+    got_unclaimed = False
+    for claimed, url, extra in sources:
+        if claimed == "unclaimed-ws" and got_unclaimed:
+            continue                     # fallback only if the documented path returned nothing
         cpages = craw = 0
-        for recs in entrance_pages(ENTRANCE_CHANNELS_URL, {"claimed": claimed}, debug=True):
+        for recs in entrance_pages(url, extra, debug=True):
             pages += 1
             cpages += 1
             if pages == 1:
@@ -222,17 +233,20 @@ def channels_from_api(since):
                     page_all_old = False
                 if lr < since or r.get("replied") is False:
                     continue
+                if r.get("stop") is True or r.get("stop_filter") is True:
+                    continue             # STOP replies aren't real threads (matches Replied-STOP)
                 phone = phone10(_first(r, "number", "phone", "contact.number"))
                 if not phone:
                     no_phone += 1
                     continue
-                cid = _first(r, "campaign_id", "last_campaign_id", "campaigns.id", "campaign.id")
-                camp = (_first(r, "campaigns.name", "campaign_name", "campaign.name")
-                        or _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or "")
+                cid = r.get("campaign_id")   # `campaigns` is {id: true}; current campaign = campaign_id
+                camp = _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or ""
                 out.append({"campaign": camp, "phone": phone, "last_response": lr})
             if page_all_old or cpages >= 500:   # sorted by last_response DESC
                 break
-        print(f"DEBUG claimed={claimed}: pages={cpages} raw={craw}")
+        print(f"DEBUG {claimed}: pages={cpages} raw={craw}")
+        if claimed == "unclaimed" and craw:
+            got_unclaimed = True
     named = sum(1 for o in out if o["campaign"])
     print(f"DEBUG channels: pages={pages} raw={raw} kept={len(out)} no_ts={no_ts} "
           f"no_phone={no_phone} with_campaign={named}")
@@ -379,10 +393,10 @@ def render(rows, groups, gstats):
     dist = table(["Status"] + [short(c) if c != "GCLV (all)" else "GCLV" for c in cols] + ["Total"], D, "l" + "r" * (len(cols) + 1)) if prog_rows else "_none_"
 
     main = (f"*EnTrance → Close drop-out funnel* · {day} · campaigns sent last {LOOKBACK_DAYS}d\n"
-            f"```{funnel}```\n"
+            f"```\n{funnel}\n```\n"
             f"_Replied-STOP = real replies · Threads = reply conversations matched by phone · "
             f"Progress = Sub / HP / follow-up / rewarm in Close after a rep status change._\n\n"
-            f"*Progressing leads — status in Close*\n```{dist}```\n"
+            f"*Progressing leads — status in Close*\n```\n{dist}\n```\n"
             f"_Merchant list in thread_ 👇")
 
     # ---- who (thread)
