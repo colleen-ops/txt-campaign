@@ -138,15 +138,38 @@ def entrance_headers():
     sys.exit("EnTrance auth failed: " + " | ".join(tried or ["no credentials set"]))
 
 
-def entrance_pages(url, extra=None):
+def _records(page):
+    """Find the record list whatever the key is (records / data / channels / rows ...)."""
+    if isinstance(page, list):
+        return page
+    for k in ("records", "data", "channels", "rows", "items", "results"):
+        v = page.get(k)
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            for vv in v.values():
+                if isinstance(vv, list):
+                    return vv
+    for v in page.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    return []
+
+
+def entrance_pages(url, extra=None, debug=False):
     headers = entrance_headers()
     lastid = None
     while True:
         params = {"limit": PAGE_CAP, "order": "DESC", **(extra or {})}
         if lastid:
             params["lastid"] = lastid
-        page = get(url, headers=headers, params=params)
-        recs = page.get("records") or page.get("data") or []
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if debug and lastid is None:
+            print(f"DEBUG GET {r.url} -> {r.status_code} body[:400]={r.text[:400]!r}")
+        if not r.ok:
+            return
+        page = r.json()
+        recs = _records(page)
         if not recs:
             return
         yield recs
@@ -171,7 +194,30 @@ def _first(r, *keys):
 
 def channels_from_api(since):
     out, raw, no_ts, no_phone, pages = [], 0, 0, 0, 0
-    for recs in entrance_pages(ENTRANCE_CHANNELS_URL):
+    variants = [
+        (ENTRANCE_CHANNELS_URL, {"claimed": "true"}),
+        (ENTRANCE_CHANNELS_URL, {"claimed": "true", "replied": "both"}),
+        (ENTRANCE_CHANNELS_URL, {}),
+        (f"https://entrancegrp.com/api/workspaces/{WORKSPACE_ID}/channels", {"claimed": "true"}),
+    ]
+    src = None
+    for url, extra in variants:
+        gen = entrance_pages(url, extra, debug=True)
+        first = next(gen, None)
+        if first:
+            src = (url, extra, first, gen)
+            print(f"DEBUG channels source: {url} {extra}")
+            break
+    if not src:
+        print("DEBUG channels: every endpoint variant returned 0 records")
+        return out
+    url, extra, first, gen = src
+
+    def _all():
+        yield first
+        yield from gen
+
+    for recs in _all():
         pages += 1
         if pages == 1:
             sample = {k: (str(v)[:60] if not isinstance(v, (dict, list)) else type(v).__name__)
