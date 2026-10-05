@@ -158,25 +158,26 @@ def _records(page):
 
 def entrance_pages(url, extra=None, debug=False):
     headers = entrance_headers()
-    lastid = None
+    lastid, cursor, seen = None, None, set()
     while True:
         params = {"limit": PAGE_CAP, "order": "DESC", **(extra or {})}
         if lastid:
             params["lastid"] = lastid
+        if cursor:
+            params["last_response"] = cursor
         r = requests.get(url, headers=headers, params=params, timeout=30)
         if debug and lastid is None:
-            print(f"DEBUG GET {r.url} -> {r.status_code} body[:400]={r.text[:400]!r}")
+            print(f"DEBUG GET {r.url} -> {r.status_code} body[:300]={r.text[:300]!r}")
         if not r.ok:
             return
         page = r.json()
-        recs = _records(page)
+        recs = [x for x in _records(page) if x.get("id") not in seen]
         if not recs:
             return
+        seen.update(x.get("id") for x in recs)
         yield recs
-        nxt = page.get("lastId") or recs[-1].get("id")
-        if nxt == lastid:
-            return
-        lastid = nxt
+        lastid = page.get("lastId") or recs[-1].get("id")
+        cursor = page.get("last_response") if isinstance(page, dict) else None
 
 
 _CAMP_NAMES = {}
@@ -194,58 +195,44 @@ def _first(r, *keys):
 
 def channels_from_api(since):
     out, raw, no_ts, no_phone, pages = [], 0, 0, 0, 0
-    variants = [
-        (ENTRANCE_CHANNELS_URL, {"claimed": "true"}),
-        (ENTRANCE_CHANNELS_URL, {"claimed": "true", "replied": "both"}),
-        (ENTRANCE_CHANNELS_URL, {}),
-        (f"https://entrancegrp.com/api/workspaces/{WORKSPACE_ID}/channels", {"claimed": "true"}),
-    ]
-    src = None
-    for url, extra in variants:
-        gen = entrance_pages(url, extra, debug=True)
-        first = next(gen, None)
-        if first:
-            src = (url, extra, first, gen)
-            print(f"DEBUG channels source: {url} {extra}")
-            break
-    if not src:
-        print("DEBUG channels: every endpoint variant returned 0 records")
-        return out
-    url, extra, first, gen = src
-
-    def _all():
-        yield first
-        yield from gen
-
-    for recs in _all():
-        pages += 1
-        if pages == 1:
-            sample = {k: (str(v)[:60] if not isinstance(v, (dict, list)) else type(v).__name__)
-                      for k, v in recs[0].items()}
-            print("DEBUG first channel record:", json.dumps(sample, default=str))
-        older = False
-        for r in recs:
-            raw += 1
-            lr = parse_ts(_first(r, "last_response", "lastResponse", "last_response_at",
-                                 "last_inbound_at", "last_inbound", "last_reply_at",
-                                 "updated_at", "last_message_at"))
-            if lr is None:
-                no_ts += 1
-                continue
-            if lr < since or r.get("replied") is False:
-                continue
-            phone = phone10(_first(r, "number", "phone", "contact.number", "contact.phone",
-                                   "meta.number", "to", "from"))
-            if not phone:
-                no_phone += 1
-                continue
-            cid = _first(r, "campaign_id", "last_campaign_id", "campaign.id", "last_campaign.id")
-            camp = (_first(r, "campaign_name", "last_campaign_name", "campaign.name",
-                           "last_campaign.name", "last_campaign_sent")
-                    or _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or "")
-            out.append({"campaign": camp, "phone": phone, "last_response": lr})
-        if pages >= 300:
-            break
+    seen_ids = set()
+    # Recent blast replies mostly sit UNCLAIMED (Claims tab); Messages inbox = claimed. Pull both.
+    for claimed in ("false", "true"):
+        cpages = craw = 0
+        for recs in entrance_pages(ENTRANCE_CHANNELS_URL, {"claimed": claimed}, debug=True):
+            pages += 1
+            cpages += 1
+            if pages == 1:
+                sample = {k: (str(v)[:60] if not isinstance(v, (dict, list)) else type(v).__name__)
+                          for k, v in recs[0].items()}
+                print("DEBUG first channel record:", json.dumps(sample, default=str))
+            page_all_old = True
+            for r in recs:
+                if r.get("id") in seen_ids:
+                    continue
+                seen_ids.add(r.get("id"))
+                raw += 1
+                craw += 1
+                lr = parse_ts(_first(r, "last_response", "lastResponse", "last_response_at",
+                                     "last_inbound_at", "updated_at"))
+                if lr is None:
+                    no_ts += 1
+                    continue
+                if lr >= since:
+                    page_all_old = False
+                if lr < since or r.get("replied") is False:
+                    continue
+                phone = phone10(_first(r, "number", "phone", "contact.number"))
+                if not phone:
+                    no_phone += 1
+                    continue
+                cid = _first(r, "campaign_id", "last_campaign_id", "campaigns.id", "campaign.id")
+                camp = (_first(r, "campaigns.name", "campaign_name", "campaign.name")
+                        or _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or "")
+                out.append({"campaign": camp, "phone": phone, "last_response": lr})
+            if page_all_old or cpages >= 500:   # sorted by last_response DESC
+                break
+        print(f"DEBUG claimed={claimed}: pages={cpages} raw={craw}")
     named = sum(1 for o in out if o["campaign"])
     print(f"DEBUG channels: pages={pages} raw={raw} kept={len(out)} no_ts={no_ts} "
           f"no_phone={no_phone} with_campaign={named}")
