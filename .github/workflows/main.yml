@@ -22,7 +22,8 @@ jobs:
           CLOSE_API_KEY: ${{ secrets.CLOSE_API_KEY }}
           ENTRANCE_APP_KEY: ${{ secrets.ENTRANCE_APP_KEY }}
           ENTRANCE_AUTH_CODE: ${{ secrets.ENTRANCE_AUTH_CODE }}
-          ENTRANCE_TOKEN_URL: ${{ vars.ENTRANCE_TOKEN_URL }}
+          ENTRANCE_EMAIL: ${{ secrets.ENTRANCE_EMAIL }}
+          ENTRANCE_PASSWORD: ${{ secrets.ENTRANCE_PASSWORD }}
           ENTRANCE_CHANNELS_URL: ${{ vars.ENTRANCE_CHANNELS_URL }}
           ENTRANCE_CAMPAIGNS_URL: ${{ vars.ENTRANCE_CAMPAIGNS_URL }}
           LOOKBACK_DAYS: "14"
