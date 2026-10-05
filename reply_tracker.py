@@ -28,7 +28,7 @@ import requests
 
 WORKSPACE_ID = os.getenv("WORKSPACE_ID") or "2373"
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS") or "14")
-CLOSE_KEY = os.getenv("CLOSE_API_KEY", "")
+CLOSE_KEY = os.getenv("CLOSE_API_KEY", "").strip()
 SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 # EnTrance auth (from the entrancesms SDK the MCP server uses):
@@ -232,8 +232,7 @@ def channels_from_api(since):
             if lr is None:
                 no_ts += 1
                 continue
-            if lr < since:
-                older = True
+            if lr < since or r.get("replied") is False:
                 continue
             phone = phone10(_first(r, "number", "phone", "contact.number", "contact.phone",
                                    "meta.number", "to", "from"))
@@ -245,7 +244,7 @@ def channels_from_api(since):
                            "last_campaign.name", "last_campaign_sent")
                     or _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or "")
             out.append({"campaign": camp, "phone": phone, "last_response": lr})
-        if older or pages >= 300:
+        if pages >= 300:
             break
     named = sum(1 for o in out if o["campaign"])
     print(f"DEBUG channels: pages={pages} raw={raw} kept={len(out)} no_ts={no_ts} "
@@ -431,6 +430,10 @@ def main():
 
     stats = json.load(open(a.stats)) if a.stats else ({} if a.csv else campaign_stats_api(since))
     channels = channels_from_csv(a.csv, since) if a.csv else channels_from_api(since)
+    t = requests.get(f"{CLOSE}/me/", auth=(CLOSE_KEY, ""), timeout=30)
+    if t.status_code == 401:
+        sys.exit("Close auth failed (401): CLOSE_API_KEY secret is wrong/expired — "
+                 "Close → Settings → Developer → API Keys, create a key, paste it into the secret.")
     rows, groups, gstats = build(channels, stats, since)
     if stats:
         before = len(rows)
