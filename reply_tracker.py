@@ -15,8 +15,8 @@ Modes:
 
 Env / GitHub Secrets:
   CLOSE_API_KEY, SLACK_BOT_TOKEN, SLACK_CHANNEL
-  ENTRANCE_APP_KEY + ENTRANCE_AUTH_CODE (exchanged for a token at ENTRANCE_TOKEN_URL), or ENTRANCE_API_KEY
-  ENTRANCE_CHANNELS_URL, ENTRANCE_CAMPAIGNS_URL   (verify vs docs.entrancegrp.com/#task-channels)
+  ENTRANCE_APP_KEY + ENTRANCE_AUTH_CODE  and/or  ENTRANCE_EMAIL + ENTRANCE_PASSWORD
+  ENTRANCE_CHANNELS_URL / ENTRANCE_CAMPAIGNS_URL (optional overrides; default apiv2 workspace paths)
   LOOKBACK_DAYS (14), WORKSPACE_ID (2373), DATA_DIR (data)
 """
 import argparse, csv, json, os, re, sys, time
@@ -28,17 +28,22 @@ import requests
 
 WORKSPACE_ID = os.getenv("WORKSPACE_ID") or "2373"
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS") or "14")
-ENTRANCE_KEY = os.getenv("ENTRANCE_API_KEY", "")          # direct bearer token, if you have one
-ENTRANCE_APP_KEY = os.getenv("ENTRANCE_APP_KEY", "")
-ENTRANCE_AUTH_CODE = os.getenv("ENTRANCE_AUTH_CODE", "")
-# api.entrancegrp.com = token host. VERIFY path + body field names vs docs / the EnTrance MCP source.
-ENTRANCE_TOKEN_URL = os.getenv("ENTRANCE_TOKEN_URL") or "https://api.entrancegrp.com/token"
 CLOSE_KEY = os.getenv("CLOSE_API_KEY", "")
 SLACK_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
+# EnTrance auth (from the entrancesms SDK the MCP server uses):
+#   1) app key + auth code  -> "Authorization: Basic base64(key:code)"
+#   2) email + password     -> POST /authentication/login -> record.access_token (Bearer)
+# Tries 1 first, falls back to 2 on 401/403. MCP notes say 1 was broken on this account.
+ENTRANCE_BASE = (os.getenv("ENTRANCE_BASE") or "https://apiv2.entrancegrp.com").rstrip("/")
+ENTRANCE_APP_KEY = os.getenv("ENTRANCE_APP_KEY", "")
+ENTRANCE_AUTH_CODE = os.getenv("ENTRANCE_AUTH_CODE", "")
+ENTRANCE_EMAIL = os.getenv("ENTRANCE_EMAIL", "")
+ENTRANCE_PASSWORD = os.getenv("ENTRANCE_PASSWORD", "")
 ENTRANCE_CHANNELS_URL = (os.getenv("ENTRANCE_CHANNELS_URL")
-                         or f"https://entrancegrp.com/api/workspaces/{WORKSPACE_ID}/channels")
-ENTRANCE_CAMPAIGNS_URL = os.getenv("ENTRANCE_CAMPAIGNS_URL", "")
+                         or f"{ENTRANCE_BASE}/workspaces/{WORKSPACE_ID}/channels")
+ENTRANCE_CAMPAIGNS_URL = (os.getenv("ENTRANCE_CAMPAIGNS_URL")
+                          or f"{ENTRANCE_BASE}/workspaces/{WORKSPACE_ID}/campaigns")
 PAGE_CAP = 20  # EnTrance hard cap; page with lastid
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 CLOSE = "https://api.close.com/api/v1"
@@ -95,26 +100,42 @@ def get(url, **kw):
 
 
 # ------------------------------------------------------------------ EnTrance
-_TOKEN = None
+_AUTH = None
+
+
+def _probe(headers):
+    r = requests.get(ENTRANCE_CAMPAIGNS_URL, headers=headers, timeout=30,
+                     params={"limit": 1, "order": "DESC"})
+    return r.status_code
 
 
 def entrance_headers():
-    """Bearer token: use ENTRANCE_API_KEY if set, else exchange app key + auth code."""
-    global _TOKEN
-    if ENTRANCE_KEY:
-        return {"Authorization": f"Bearer {ENTRANCE_KEY}"}
-    if _TOKEN is None:
-        if not (ENTRANCE_APP_KEY and ENTRANCE_AUTH_CODE):
-            sys.exit("EnTrance creds missing: set ENTRANCE_APP_KEY + ENTRANCE_AUTH_CODE (or ENTRANCE_API_KEY)")
-        r = requests.post(ENTRANCE_TOKEN_URL, timeout=30,
-                          json={"app_key": ENTRANCE_APP_KEY, "auth_code": ENTRANCE_AUTH_CODE})
-        r.raise_for_status()
-        j = r.json()
-        _TOKEN = (j.get("access_token") or j.get("token")
-                  or (j.get("record") or {}).get("token") or (j.get("data") or {}).get("token"))
-        if not _TOKEN:
-            sys.exit(f"EnTrance token exchange: no token in response keys {list(j)}")
-    return {"Authorization": f"Bearer {_TOKEN}"}
+    global _AUTH
+    if _AUTH:
+        return _AUTH
+    tried = []
+    if ENTRANCE_APP_KEY and ENTRANCE_AUTH_CODE:
+        import base64
+        b = base64.b64encode(f"{ENTRANCE_APP_KEY}:{ENTRANCE_AUTH_CODE}".encode()).decode()
+        h = {"Authorization": f"Basic {b}", "Content-Type": "application/json"}
+        code = _probe(h)
+        tried.append(f"app key/auth code -> {code}")
+        if code == 200:
+            _AUTH = h
+            print("EnTrance auth: app key + auth code")
+            return _AUTH
+    if ENTRANCE_EMAIL and ENTRANCE_PASSWORD:
+        r = requests.post(f"{ENTRANCE_BASE}/authentication/login", timeout=30,
+                          json={"email": ENTRANCE_EMAIL, "password": ENTRANCE_PASSWORD})
+        tok = (r.json().get("record") or {}).get("access_token") if r.ok else None
+        tried.append(f"email/password login -> {r.status_code}")
+        if tok:
+            _AUTH = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+            print("EnTrance auth: email/password login")
+            return _AUTH
+        if not r.ok:
+            tried.append(r.text[:300])
+    sys.exit("EnTrance auth failed: " + " | ".join(tried or ["no credentials set"]))
 
 
 def entrance_pages(url, extra=None):
@@ -135,18 +156,28 @@ def entrance_pages(url, extra=None):
         lastid = nxt
 
 
+_CAMP_NAMES = {}
+
+
 def channels_from_api(since):
-    out = []
+    out, logged = [], False
     for recs in entrance_pages(ENTRANCE_CHANNELS_URL):
         older = False
-        for r in recs:  # VERIFY field names vs docs
-            lr = parse_ts(r.get("last_response") or r.get("lastResponse"))
+        if not logged:
+            print("channel record keys:", sorted(recs[0].keys()))
+            logged = True
+        for r in recs:  # field names defensive; check the logged keys on first run
+            lr = parse_ts(r.get("last_response") or r.get("lastResponse") or r.get("last_response_at")
+                          or r.get("last_inbound_at"))
             if lr is None:
                 continue
             if lr < since:
                 older = True
                 continue
-            out.append({"campaign": r.get("campaign_name") or (r.get("campaign") or {}).get("name", ""),
+            camp = (r.get("campaign_name") or r.get("last_campaign_name")
+                    or (r.get("campaign") or {}).get("name", "")
+                    or _CAMP_NAMES.get(r.get("campaign_id") or r.get("last_campaign_id"), ""))
+            out.append({"campaign": camp,
                         "phone": phone10(r.get("number") or (r.get("contact") or {}).get("number")),
                         "last_response": lr})
         if older:
@@ -168,11 +199,10 @@ def channels_from_csv(path, since):
 def campaign_stats_api(since):
     """{campaign_name: {dlv, replied, stop}} for campaigns sent in window. VERIFY field names."""
     stats = {}
-    if not ENTRANCE_CAMPAIGNS_URL:
-        return stats
-    for recs in entrance_pages(ENTRANCE_CAMPAIGNS_URL, {"workspaceId": WORKSPACE_ID}):
+    for recs in entrance_pages(ENTRANCE_CAMPAIGNS_URL, {"types": "SINGLE_BLAST"}):
         older = False
         for c in recs:
+            _CAMP_NAMES[c.get("id")] = c.get("name", "")
             sent = parse_ts(c.get("sent_at") or c.get("sentAt"))
             if not sent:
                 continue
@@ -331,8 +361,8 @@ def main():
         sys.exit("CLOSE_API_KEY missing")
     since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
-    channels = channels_from_csv(a.csv, since) if a.csv else channels_from_api(since)
     stats = json.load(open(a.stats)) if a.stats else ({} if a.csv else campaign_stats_api(since))
+    channels = channels_from_csv(a.csv, since) if a.csv else channels_from_api(since)
     rows, groups, gstats = build(channels, stats, since)
     if stats:
         rows = [r for r in rows if r["campaign"] in stats]   # only campaigns sent in window
