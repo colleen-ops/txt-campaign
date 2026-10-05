@@ -159,29 +159,51 @@ def entrance_pages(url, extra=None):
 _CAMP_NAMES = {}
 
 
+def _first(r, *keys):
+    for k in keys:
+        v = r
+        for part in k.split("."):
+            v = v.get(part) if isinstance(v, dict) else None
+        if v not in (None, ""):
+            return v
+    return None
+
+
 def channels_from_api(since):
-    out, logged = [], False
+    out, raw, no_ts, no_phone, pages = [], 0, 0, 0, 0
     for recs in entrance_pages(ENTRANCE_CHANNELS_URL):
+        pages += 1
+        if pages == 1:
+            sample = {k: (str(v)[:60] if not isinstance(v, (dict, list)) else type(v).__name__)
+                      for k, v in recs[0].items()}
+            print("DEBUG first channel record:", json.dumps(sample, default=str))
         older = False
-        if not logged:
-            print("channel record keys:", sorted(recs[0].keys()))
-            logged = True
-        for r in recs:  # field names defensive; check the logged keys on first run
-            lr = parse_ts(r.get("last_response") or r.get("lastResponse") or r.get("last_response_at")
-                          or r.get("last_inbound_at"))
+        for r in recs:
+            raw += 1
+            lr = parse_ts(_first(r, "last_response", "lastResponse", "last_response_at",
+                                 "last_inbound_at", "last_inbound", "last_reply_at",
+                                 "updated_at", "last_message_at"))
             if lr is None:
+                no_ts += 1
                 continue
             if lr < since:
                 older = True
                 continue
-            camp = (r.get("campaign_name") or r.get("last_campaign_name")
-                    or (r.get("campaign") or {}).get("name", "")
-                    or _CAMP_NAMES.get(r.get("campaign_id") or r.get("last_campaign_id"), ""))
-            out.append({"campaign": camp,
-                        "phone": phone10(r.get("number") or (r.get("contact") or {}).get("number")),
-                        "last_response": lr})
-        if older:
+            phone = phone10(_first(r, "number", "phone", "contact.number", "contact.phone",
+                                   "meta.number", "to", "from"))
+            if not phone:
+                no_phone += 1
+                continue
+            cid = _first(r, "campaign_id", "last_campaign_id", "campaign.id", "last_campaign.id")
+            camp = (_first(r, "campaign_name", "last_campaign_name", "campaign.name",
+                           "last_campaign.name", "last_campaign_sent")
+                    or _CAMP_NAMES.get(cid) or _CAMP_NAMES.get(str(cid)) or "")
+            out.append({"campaign": camp, "phone": phone, "last_response": lr})
+        if older or pages >= 300:
             break
+    named = sum(1 for o in out if o["campaign"])
+    print(f"DEBUG channels: pages={pages} raw={raw} kept={len(out)} no_ts={no_ts} "
+          f"no_phone={no_phone} with_campaign={named}")
     return out
 
 
@@ -203,6 +225,7 @@ def campaign_stats_api(since):
         older = False
         for c in recs:
             _CAMP_NAMES[c.get("id")] = c.get("name", "")
+            _CAMP_NAMES[str(c.get("id"))] = c.get("name", "")
             sent = parse_ts(c.get("sent_at") or c.get("sentAt"))
             if not sent:
                 continue
@@ -294,7 +317,7 @@ def table(headers, rows, align):
 def render(rows, groups, gstats):
     day = datetime.now(timezone.utc).strftime("%a %b %d")
     # ---- funnel
-    H = ["Campaign", "Dlv", "Replied", "%dlv", "Live", "Threads", "InClose", "Worked", "%found", "Prog"]
+    H = ["Campaign", "Dlv", "Replied-STOP", "Threads", "Progress"]
     body, tot = [], Counter()
     order = sorted(groups, key=lambda g: -gstats[g]["dlv"] if gstats else 0)
     for g in order:
@@ -304,14 +327,12 @@ def render(rows, groups, gstats):
         found = sum(r["found"] for r in rr)
         worked = sum(r["rep_changed"] for r in rr)
         prog = sum(r["progressing"] for r in rr)
-        body.append([short(g) if g != "GCLV (all)" else "GCLV (all)", f"{s['dlv']:,}", f"{s['replied']:,}", pct(s["replied"], s["dlv"]), live,
-                     len(rr), found, worked, pct(worked, found), prog])
+        body.append([short(g) if g != "GCLV (all)" else "GCLV (all)", f"{s['dlv']:,}", f"{live:,}",
+                     len(rr), prog])
         tot.update(dlv=s["dlv"], replied=s["replied"], live=live, threads=len(rr),
                    found=found, worked=worked, prog=prog)
-    body.append(["TOTAL", f"{tot['dlv']:,}", f"{tot['replied']:,}", pct(tot["replied"], tot["dlv"]),
-                 tot["live"], tot["threads"], tot["found"], tot["worked"],
-                 pct(tot["worked"], tot["found"]), tot["prog"]])
-    funnel = table(H, body, "lrrrrrrrrr")
+    body.append(["TOTAL", f"{tot['dlv']:,}", f"{tot['live']:,}", tot["threads"], tot["prog"]])
+    funnel = table(H, body, "lrrrr")
 
     # ---- progressing distribution
     prog_rows = [r for r in rows if r["progressing"]]
@@ -327,7 +348,8 @@ def render(rows, groups, gstats):
 
     main = (f"*EnTrance → Close drop-out funnel* · {day} · campaigns sent last {LOOKBACK_DAYS}d\n"
             f"```{funnel}```\n"
-            f"_Worked = rep moved status (Sub / HP / follow-up / rewarm / HARD NO); excludes Outbound reloads & New flips._\n\n"
+            f"_Replied-STOP = real replies · Threads = reply conversations matched by phone · "
+            f"Progress = Sub / HP / follow-up / rewarm in Close after a rep status change._\n\n"
             f"*Progressing leads — status in Close*\n```{dist}```\n"
             f"_Merchant list in thread_ 👇")
 
@@ -365,7 +387,9 @@ def main():
     channels = channels_from_csv(a.csv, since) if a.csv else channels_from_api(since)
     rows, groups, gstats = build(channels, stats, since)
     if stats:
+        before = len(rows)
         rows = [r for r in rows if r["campaign"] in stats]   # only campaigns sent in window
+        print(f"DEBUG rows: {before} matched-in-Close-step, {len(rows)} after campaign filter")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out = DATA_DIR / f"{datetime.now(timezone.utc):%Y-%m-%d}.csv"
